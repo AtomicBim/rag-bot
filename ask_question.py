@@ -10,7 +10,7 @@ with open("config.json", "r") as f:
     
 api_key = config["OPENAI_API_KEY"]
 
-OPENAI_MODEL = "gpt-o3"
+OPENAI_MODEL = "gpt-4o"
 
 app = FastAPI(title="OpenAI Gateway Service")
 openai_client = OpenAI(api_key=api_key)
