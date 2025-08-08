@@ -1,51 +1,82 @@
 import os
+import json
+import logging
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from openai import OpenAI
-import json
+from openai import AsyncOpenAI
+from dotenv import load_dotenv
 
-with open("config.json", "r") as f:
-    config = json.load(f)
-    
-api_key = config["OPENAI_API_KEY"]
+# --- Конфигурация и инициализация ---
 
-OPENAI_MODEL = "gpt-o3"
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-app = FastAPI(title="OpenAI Gateway Service")
-openai_client = OpenAI(api_key=api_key)
+# Загрузка переменных окружения из файла .env
+load_dotenv()
+
+# Загрузка основной конфигурации
+try:
+    with open("config.json", "r", encoding="utf-8") as f:
+        config = json.load(f)
+except FileNotFoundError:
+    logging.error("Файл config.json не найден. Завершение работы.")
+    exit()
+except json.JSONDecodeError:
+    logging.error("Ошибка чтения JSON из config.json. Завершение работы.")
+    exit()
+
+# Загрузка системного промпта
+try:
+    with open("system_prompt.txt", "r", encoding="utf-8") as f:
+        SYSTEM_PROMPT = f.read().strip()
+except FileNotFoundError:
+    logging.error("Файл system_prompt.txt не найден. Завершение работы.")
+    exit()
+
+# Получение ключа API и настройка клиента OpenAI
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    logging.error("Переменная окружения OPENAI_API_KEY не установлена.")
+    raise ValueError("Необходимо установить переменную окружения OPENAI_API_KEY")
+
+app = FastAPI(title="Advanced OpenAI Gateway Service")
+openai_client = AsyncOpenAI(api_key=api_key)
+
+# --- Модели данных ---
 
 class RAGRequest(BaseModel):
     question: str
     context: str
 
-@app.post("/generate_answer")
+class AnswerResponse(BaseModel):
+    answer: str
+
+# --- Эндпоинты API ---
+
+@app.post("/generate_answer", response_model=AnswerResponse)
 async def generate_answer(request: RAGRequest):
     """
-    Принимает вопрос и контекст, обращается к OpenAI и возвращает ответ.
-    """
-    system_prompt = """
-    Перефразируй промпт на основе контекста базы знаний.
-
-    Ты — эксперт-аналитик, работающий с базой знаний компании. Твоя задача — предоставить ответ на вопрос пользователя, основываясь на предоставленных фрагментах документов (контексте) и твоей интерпретации их.
-    Внимательно изучи весь контекст. Синтезируй информацию из разных фрагментов, если это необходимо для полноты ответа.
-    Если после анализа ты уверен, что в контексте нет ответа на вопрос, вежливо сообщи: 'К сожалению, в предоставленных документах не найдено информации по вашему вопросу.'
+    Принимает вопрос и контекст, асинхронно обращается к OpenAI и возвращает ответ.
     """
     user_prompt = f"КОНТЕКСТ:\n---\n{request.context}\n---\nВОПРОС: {request.question}\n\nОТВЕТ:"
 
     try:
-        response = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
+        response = await openai_client.chat.completions.create(
+            model=config.get("openai_model", "gpt-4o"),
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.1,
+            temperature=config.get("temperature", 0.1),
         )
         answer = response.choices[0].message.content
         return {"answer": answer}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logging.error(f"Произошла ошибка при обращении к OpenAI: {e}")
+        raise HTTPException(status_code=500, detail="Внутренняя ошибка сервера. Не удалось обработать запрос.")
+
+# --- Запуск приложения ---
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
