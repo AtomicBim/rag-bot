@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
+# тест
+
 # --- Конфигурация и инициализация ---
 
 # Настройка логирования
