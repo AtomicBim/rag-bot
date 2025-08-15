@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
-# --- Конфигурация ---
+# --- Конфигурация (без изменений) ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ class AppConfig:
 app_config = AppConfig()
 app = FastAPI(title="Advanced OpenAI Gateway Service")
 
-# --- Модели данных (ИЗМЕНЕНЫ) ---
+# --- Модели данных (без изменений) ---
 
 class SourceChunk(BaseModel):
     text: str
@@ -58,14 +58,14 @@ class SourceChunk(BaseModel):
 
 class RAGRequest(BaseModel):
     question: str
-    context: List[SourceChunk] # Контекст теперь - список объектов
+    context: List[SourceChunk]
 
 class AnswerParagraph(BaseModel):
     paragraph: str
     source: SourceChunk
 
 class AnswerResponse(BaseModel):
-    answer: List[AnswerParagraph] # Ответ теперь - список объектов
+    answer: List[AnswerParagraph]
 
 # --- Эндпоинты API ---
 
@@ -73,7 +73,6 @@ class OpenAIService:
     def __init__(self, config: AppConfig):
         self.config = config
     
-    # ИЗМЕНЕНО: Формируем промпт из списка фрагментов
     def _build_user_prompt(self, question: str, context: List[SourceChunk]) -> str:
         context_parts = []
         for i, chunk in enumerate(context):
@@ -82,14 +81,16 @@ class OpenAIService:
         formatted_context = "\n---\n".join(context_parts)
         return f"КОНТЕКСТ:\n---\n{formatted_context}\n---\nВОПРОС: {question}"
     
-    # ИЗМЕНЕНО: Обрабатываем JSON-ответ от модели
+    # ##################################################################
+    # ИЗМЕНЕНИЕ ЗДЕСЬ: Обновлена логика парсинга ответа от LLM
+    # ##################################################################
     async def generate_answer(self, question: str, context: List[SourceChunk]) -> List[Dict[str, Any]]:
         user_prompt = self._build_user_prompt(question, context)
         
         try:
             response = await self.config.openai_client.chat.completions.create(
                 model=self.config.config.get("openai_model", "gpt-4o"),
-                response_format={"type": "json_object"}, # Просим модель вернуть JSON
+                response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": self.config.system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -99,16 +100,26 @@ class OpenAIService:
             raw_answer = response.choices[0].message.content
             
             try:
-                # Пытаемся распарсить JSON из ответа модели
                 parsed_json = json.loads(raw_answer)
-                # Модель может вернуть список или словарь с ключом "answer"
+                
+                # Случай 1: Правильный формат (список объектов)
                 if isinstance(parsed_json, list):
                     return parsed_json
+                
+                # Случай 2: Ответ обернут в ключ "answer"
                 elif isinstance(parsed_json, dict) and "answer" in parsed_json and isinstance(parsed_json["answer"], list):
                     return parsed_json["answer"]
+
+                # >>> НОВЫЙ СЛУЧАЙ 3: Модель вернула один объект вместо списка
+                elif isinstance(parsed_json, dict) and "paragraph" in parsed_json and "source" in parsed_json:
+                    logger.warning("LLM вернула один объект вместо списка. Оборачиваю его в список.")
+                    return [parsed_json] # Просто оборачиваем полученный объект в список
+                
+                # Запасной вариант для других неожиданных структур
                 else:
                     logger.warning(f"LLM вернула неожиданную JSON-структуру: {raw_answer}")
                     return []
+
             except json.JSONDecodeError:
                 logger.error(f"Не удалось декодировать JSON от LLM: {raw_answer}")
                 return []
@@ -127,6 +138,6 @@ async def generate_answer(request: RAGRequest):
     answer_list = await openai_service.generate_answer(request.question, request.context)
     return {"answer": answer_list}
 
-# --- Запуск приложения ---
+# --- Запуск приложения (без изменений) ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
