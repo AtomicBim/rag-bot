@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Dict, Any
 
 import uvicorn
@@ -18,28 +19,32 @@ logger = logging.getLogger(__name__)
 
 class AppConfig:
     def __init__(self):
-        load_dotenv()
+        # Получаем директорию, где находится скрипт
+        self.script_dir = Path(__file__).parent.absolute()
+        load_dotenv(self.script_dir / ".env")  # Указываем путь к .env
         self.config = self._load_config()
         self.system_prompt = self._load_system_prompt()
         self.openai_client = self._setup_openai_client()
     
     def _load_config(self) -> Dict[str, Any]:
+        config_path = self.script_dir / "config.json"
         try:
-            with open("config.json", "r", encoding="utf-8") as f:
+            with open(config_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except FileNotFoundError:
-            logger.error("Файл config.json не найден")
+            logger.error(f"Файл config.json не найден по пути: {config_path}")
             sys.exit(1)
         except json.JSONDecodeError:
             logger.error("Ошибка чтения JSON из config.json")
             sys.exit(1)
     
     def _load_system_prompt(self) -> str:
+        prompt_path = self.script_dir / "system_prompt.txt"
         try:
-            with open("system_prompt.txt", "r", encoding="utf-8") as f:
+            with open(prompt_path, "r", encoding="utf-8") as f:
                 return f.read().strip()
         except FileNotFoundError:
-            logger.error("Файл system_prompt.txt не найден")
+            logger.error(f"Файл system_prompt.txt не найден по пути: {prompt_path}")
             sys.exit(1)
     
     def _setup_openai_client(self) -> AsyncOpenAI:
