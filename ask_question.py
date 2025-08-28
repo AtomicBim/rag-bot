@@ -3,12 +3,13 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import AsyncOpenAI
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 # --- Конфигурация ---
@@ -25,6 +26,7 @@ class AppConfig:
         self.config = self._load_config()
         self.system_prompt = self._load_system_prompt()
         self.openai_client = self._setup_openai_client()
+        self.gemini_client = self._setup_gemini_client()
     
     def _load_config(self) -> Dict[str, Any]:
         config_path = self.script_dir / "config.json"
@@ -50,63 +52,184 @@ class AppConfig:
     def _setup_openai_client(self) -> AsyncOpenAI:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            logger.error("Переменная окружения OPENAI_API_KEY не установлена")
-            raise ValueError("Необходимо установить переменную окружения OPENAI_API_KEY")
+            logger.warning("Переменная окружения OPENAI_API_KEY не установлена")
+            return None
         return AsyncOpenAI(api_key=api_key)
+    
+    def _setup_gemini_client(self):
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            logger.warning("Переменная окружения GEMINI_API_KEY не установлена")
+            return None
+        genai.configure(api_key=api_key)
+        return genai
 
 
 app_config = AppConfig()
-app = FastAPI(title="Advanced OpenAI Gateway Service")
+app = FastAPI(title="Advanced AI Gateway Service")
 
 # --- Модели данных ---
 
 class RAGRequest(BaseModel):
     question: str
     context: str
+    model_provider: str = None  # Optional override for model provider
 
 class AnswerResponse(BaseModel):
     answer: str
+    model_used: str
+
+class ModelStatus(BaseModel):
+    provider: str
+    model_name: str
+    available: bool
+    error: Optional[str] = None
+
+class AvailableModelsResponse(BaseModel):
+    models: list[ModelStatus]
+    default_provider: str
 
 # --- Эндпоинты API ---
 
-class OpenAIService:
+class AIService:
     def __init__(self, config: AppConfig):
         self.config = config
     
     def _build_user_prompt(self, question: str, context: str) -> str:
         return f"КОНТЕКСТ:\n---\n{context}\n---\nВОПРОС: {question}\n\nОТВЕТ:"
     
-    async def generate_answer(self, question: str, context: str) -> str:
+    async def generate_answer(self, question: str, context: str, model_provider: str = None) -> tuple[str, str]:
+        provider = model_provider or self.config.config.get("model_provider", "openai")
+        
+        if provider == "openai":
+            return await self._generate_openai_answer(question, context)
+        elif provider == "gemini":
+            return await self._generate_gemini_answer(question, context)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Неподдерживаемый провайдер модели: {provider}"
+            )
+    
+    async def _generate_openai_answer(self, question: str, context: str) -> tuple[str, str]:
+        if not self.config.openai_client:
+            raise HTTPException(
+                status_code=500,
+                detail="OpenAI клиент не настроен. Проверьте OPENAI_API_KEY."
+            )
+        
         user_prompt = self._build_user_prompt(question, context)
+        model_name = self.config.config.get("openai_model", "gpt-4o")
         
         try:
             response = await self.config.openai_client.chat.completions.create(
-                model=self.config.config.get("openai_model", "gpt-4o"),
+                model=model_name,
                 messages=[
                     {"role": "system", "content": self.config.system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=self.config.config.get("temperature", 0.1),
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content, model_name
         except Exception as e:
             logger.error(f"Ошибка при обращении к OpenAI: {e}")
             raise HTTPException(
                 status_code=500, 
-                detail="Внутренняя ошибка сервера. Не удалось обработать запрос."
+                detail="Внутренняя ошибка сервера. Не удалось обработать запрос OpenAI."
             )
+    
+    async def _generate_gemini_answer(self, question: str, context: str) -> tuple[str, str]:
+        if not self.config.gemini_client:
+            raise HTTPException(
+                status_code=500,
+                detail="Gemini клиент не настроен. Проверьте GEMINI_API_KEY."
+            )
+        
+        user_prompt = self._build_user_prompt(question, context)
+        model_name = self.config.config.get("gemini_model", "gemini-1.5-flash")
+        
+        try:
+            model = self.config.gemini_client.GenerativeModel(model_name)
+            
+            full_prompt = f"{self.config.system_prompt}\n\n{user_prompt}"
+            
+            response = await model.generate_content_async(
+                full_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=self.config.config.get("temperature", 0.1)
+                )
+            )
+            
+            return response.text, model_name
+        except Exception as e:
+            logger.error(f"Ошибка при обращении к Gemini: {e}")
+            raise HTTPException(
+                status_code=500, 
+                detail="Внутренняя ошибка сервера. Не удалось обработать запрос Gemini."
+            )
+    
+    def get_model_status(self) -> list[ModelStatus]:
+        models = []
+        
+        # Check OpenAI status
+        openai_error = None
+        openai_available = bool(self.config.openai_client)
+        if not openai_available:
+            openai_error = "OPENAI_API_KEY не установлен"
+        
+        models.append(ModelStatus(
+            provider="openai",
+            model_name=self.config.config.get("openai_model", "gpt-4o"),
+            available=openai_available,
+            error=openai_error
+        ))
+        
+        # Check Gemini status
+        gemini_error = None
+        gemini_available = bool(self.config.gemini_client)
+        if not gemini_available:
+            gemini_error = "GEMINI_API_KEY не установлен"
+        
+        models.append(ModelStatus(
+            provider="gemini",
+            model_name=self.config.config.get("gemini_model", "gemini-1.5-flash"),
+            available=gemini_available,
+            error=gemini_error
+        ))
+        
+        return models
 
 
-openai_service = OpenAIService(app_config)
+ai_service = AIService(app_config)
 
 
 @app.post("/generate_answer", response_model=AnswerResponse)
 async def generate_answer(request: RAGRequest):
     """
-    Принимает вопрос и контекст, асинхронно обращается к OpenAI и возвращает ответ.
+    Принимает вопрос и контекст, асинхронно обращается к AI модели и возвращает ответ.
+    Поддерживает OpenAI GPT и Google Gemini модели.
     """
-    answer = await openai_service.generate_answer(request.question, request.context)
-    return {"answer": answer}
+    answer, model_used = await ai_service.generate_answer(
+        request.question, 
+        request.context, 
+        request.model_provider
+    )
+    return {"answer": answer, "model_used": model_used}
+
+
+@app.get("/models", response_model=AvailableModelsResponse)
+async def get_available_models():
+    """
+    Возвращает информацию о доступных AI моделях и их статусе.
+    """
+    models = ai_service.get_model_status()
+    default_provider = app_config.config.get("model_provider", "openai")
+    
+    return AvailableModelsResponse(
+        models=models,
+        default_provider=default_provider
+    )
+
 
 # --- Запуск приложения ---
 
