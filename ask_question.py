@@ -3,7 +3,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -12,11 +12,9 @@ from openai import AsyncOpenAI
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# --- Конфигурация ---
-
+# --- Конфигурация (без изменений) ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 
 class AppConfig:
     def __init__(self):
@@ -64,19 +62,26 @@ class AppConfig:
         genai.configure(api_key=api_key)
         return genai
 
-
 app_config = AppConfig()
-app = FastAPI(title="Advanced AI Gateway Service")
+app = FastAPI(title="Advanced OpenAI Gateway Service")
 
-# --- Модели данных ---
+# --- Модели данных (без изменений) ---
+
+class SourceChunk(BaseModel):
+    text: str
+    file: str
 
 class RAGRequest(BaseModel):
     question: str
-    context: str
+    context: List[SourceChunk]
     model_provider: str = None  # Optional override for model provider
 
+class AnswerParagraph(BaseModel):
+    paragraph: str
+    source: SourceChunk
+
 class AnswerResponse(BaseModel):
-    answer: str
+    answer: List[AnswerParagraph]
     model_used: str
 
 class ModelStatus(BaseModel):
@@ -86,7 +91,7 @@ class ModelStatus(BaseModel):
     error: Optional[str] = None
 
 class AvailableModelsResponse(BaseModel):
-    models: list[ModelStatus]
+    models: List[ModelStatus]
     default_provider: str
 
 # --- Эндпоинты API ---
@@ -95,10 +100,15 @@ class AIService:
     def __init__(self, config: AppConfig):
         self.config = config
     
-    def _build_user_prompt(self, question: str, context: str) -> str:
-        return f"КОНТЕКСТ:\n---\n{context}\n---\nВОПРОС: {question}\n\nОТВЕТ:"
+    def _build_user_prompt(self, question: str, context: List[SourceChunk]) -> str:
+        context_parts = []
+        for i, chunk in enumerate(context):
+            context_parts.append(f"ФРАГМЕНТ {i+1} (ИСТОЧНИК: {chunk.file}):\n{chunk.text}")
+        
+        formatted_context = "\n---\n".join(context_parts)
+        return f"КОНТЕКСТ:\n---\n{formatted_context}\n---\nВОПРОС: {question}"
     
-    async def generate_answer(self, question: str, context: str, model_provider: str = None) -> tuple[str, str]:
+    async def generate_answer(self, question: str, context: List[SourceChunk], model_provider: str = None) -> tuple[List[Dict[str, Any]], str]:
         provider = model_provider or self.config.config.get("model_provider", "openai")
         
         if provider == "openai":
@@ -111,26 +121,53 @@ class AIService:
                 detail=f"Неподдерживаемый провайдер модели: {provider}"
             )
     
-    async def _generate_openai_answer(self, question: str, context: str) -> tuple[str, str]:
+    async def _generate_openai_answer(self, question: str, context: List[SourceChunk]) -> tuple[List[Dict[str, Any]], str]:
         if not self.config.openai_client:
             raise HTTPException(
                 status_code=500,
                 detail="OpenAI клиент не настроен. Проверьте OPENAI_API_KEY."
             )
         
-        user_prompt = self._build_user_prompt(question, context)
         model_name = self.config.config.get("openai_model", "gpt-4o")
+        user_prompt = self._build_user_prompt(question, context)
         
         try:
             response = await self.config.openai_client.chat.completions.create(
                 model=model_name,
+                response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": self.config.system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=self.config.config.get("temperature", 0.1),
             )
-            return response.choices[0].message.content, model_name
+            raw_answer = response.choices[0].message.content
+            
+            try:
+                parsed_json = json.loads(raw_answer)
+                
+                # Случай 1: Правильный формат (список объектов)
+                if isinstance(parsed_json, list):
+                    return parsed_json, model_name
+                
+                # Случай 2: Ответ обернут в ключ "answer"
+                elif isinstance(parsed_json, dict) and "answer" in parsed_json and isinstance(parsed_json["answer"], list):
+                    return parsed_json["answer"], model_name
+
+                # Случай 3: Модель вернула один объект вместо списка
+                elif isinstance(parsed_json, dict) and "paragraph" in parsed_json and "source" in parsed_json:
+                    logger.warning("LLM вернула один объект вместо списка. Оборачиваю его в список.")
+                    return [parsed_json], model_name
+                
+                # Запасной вариант для других неожиданных структур
+                else:
+                    logger.warning(f"LLM вернула неожиданную JSON-структуру: {raw_answer}")
+                    return [], model_name
+
+            except json.JSONDecodeError:
+                logger.error(f"Не удалось декодировать JSON от LLM: {raw_answer}")
+                return [], model_name
+
         except Exception as e:
             logger.error(f"Ошибка при обращении к OpenAI: {e}")
             raise HTTPException(
@@ -138,7 +175,7 @@ class AIService:
                 detail="Внутренняя ошибка сервера. Не удалось обработать запрос OpenAI."
             )
     
-    async def _generate_gemini_answer(self, question: str, context: str) -> tuple[str, str]:
+    async def _generate_gemini_answer(self, question: str, context: List[SourceChunk]) -> tuple[List[Dict[str, Any]], str]:
         if not self.config.gemini_client:
             raise HTTPException(
                 status_code=500,
@@ -160,7 +197,26 @@ class AIService:
                 )
             )
             
-            return response.text, model_name
+            raw_answer = response.text
+            
+            try:
+                parsed_json = json.loads(raw_answer)
+                
+                if isinstance(parsed_json, list):
+                    return parsed_json, model_name
+                elif isinstance(parsed_json, dict) and "answer" in parsed_json and isinstance(parsed_json["answer"], list):
+                    return parsed_json["answer"], model_name
+                elif isinstance(parsed_json, dict) and "paragraph" in parsed_json and "source" in parsed_json:
+                    logger.warning("Gemini вернула один объект вместо списка. Оборачиваю его в список.")
+                    return [parsed_json], model_name
+                else:
+                    logger.warning(f"Gemini вернула неожиданную JSON-структуру: {raw_answer}")
+                    return [], model_name
+
+            except json.JSONDecodeError:
+                logger.error(f"Не удалось декодировать JSON от Gemini: {raw_answer}")
+                return [], model_name
+            
         except Exception as e:
             logger.error(f"Ошибка при обращении к Gemini: {e}")
             raise HTTPException(
@@ -168,7 +224,7 @@ class AIService:
                 detail="Внутренняя ошибка сервера. Не удалось обработать запрос Gemini."
             )
     
-    def get_model_status(self) -> list[ModelStatus]:
+    def get_model_status(self) -> List[ModelStatus]:
         models = []
         
         # Check OpenAI status
@@ -199,9 +255,7 @@ class AIService:
         
         return models
 
-
 ai_service = AIService(app_config)
-
 
 @app.post("/generate_answer", response_model=AnswerResponse)
 async def generate_answer(request: RAGRequest):
@@ -209,13 +263,12 @@ async def generate_answer(request: RAGRequest):
     Принимает вопрос и контекст, асинхронно обращается к AI модели и возвращает ответ.
     Поддерживает OpenAI GPT и Google Gemini модели.
     """
-    answer, model_used = await ai_service.generate_answer(
+    answer_list, model_used = await ai_service.generate_answer(
         request.question, 
         request.context, 
         request.model_provider
     )
-    return {"answer": answer, "model_used": model_used}
-
+    return {"answer": answer_list, "model_used": model_used}
 
 @app.get("/models", response_model=AvailableModelsResponse)
 async def get_available_models():
@@ -230,8 +283,6 @@ async def get_available_models():
         default_provider=default_provider
     )
 
-
-# --- Запуск приложения ---
-
+# --- Запуск приложения (без изменений) ---
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
