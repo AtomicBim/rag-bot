@@ -15,6 +15,8 @@ services:
     environment:
       - NO_PROXY=192.168.42.188,192.168.45.55,192.168.45.79,192.168.56.1
       - PYTHONUNBUFFERED=1
+      - HTTPS_PROXY=socks5://172.17.0.1:10808
+      - HTTP_PROXY=socks5://172.17.0.1:10808
     # Монтируем .env файл если он существует
     volumes:
       - ./.env:/app/.env:ro
